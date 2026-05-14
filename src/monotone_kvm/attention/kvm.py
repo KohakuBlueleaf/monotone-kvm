@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .helpers import apply_rope, build_rope, lower_right_causal_mask
+from ..helpers import apply_rope, build_rope, lower_right_causal_mask
 
 
 @dataclass
@@ -298,3 +298,28 @@ class KVMAttention(nn.Module):
 
         y = torch.cat(outs, dim=2).transpose(1, 2).reshape(B, T, -1)
         return self.c_proj(y)
+
+    # -- parallel prefill: PHASE 1 (merge recurrence) + PHASE 2, both Triton --
+    def forward_triton(self, x: torch.Tensor) -> torch.Tensor:
+        """Parallel prefill with both phases on Triton kernels; fully
+        differentiable (the merge routing is frozen, exactly as in `forward`)."""
+        from ..triton import kvm_triton_forward
+
+        return kvm_triton_forward(self, x)
+
+    def _can_use_triton(self, x: torch.Tensor) -> bool:
+        """The Triton KVM path needs CUDA, a chunk-aligned tail, and the
+        vlens / merge-gate / head-temp features off (the kernel's restriction)."""
+        T = x.shape[1]
+        front = min(T, self.bswa_len)
+        return (
+            x.is_cuda
+            and (T - front) % self.chunk_len == 0
+            and not (
+                self.cfg.use_vlens or self.cfg.use_merge_gate or self.cfg.use_head_temps
+            )
+        )
+
+    def forward_auto(self, x: torch.Tensor) -> torch.Tensor:
+        """The Triton path when usable, else the naive recurrence."""
+        return self.forward_triton(x) if self._can_use_triton(x) else self.forward(x)

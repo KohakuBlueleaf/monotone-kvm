@@ -14,8 +14,8 @@ Plus `TinyLM`, a small Transformer language model that can use either.
 
 from .scheduler import (
     BucketScheduler,
-    FixedScheduler,
     LinearScheduler,
+    LogBudgetScheduler,
     LogScheduler,
     PowerScheduler,
     SqrtScheduler,
@@ -23,17 +23,24 @@ from .scheduler import (
     get_scheduler,
     simulate,
 )
-from .kvm import KVMAttention, KVMConfig
-from .monotone import MonotoneKVMAttention, MonotoneKVMConfig
-from .plain import PlainAttention, PlainAttentionConfig
+from .attention import (
+    KVMAttention,
+    KVMConfig,
+    MonotoneKVMAttention,
+    MonotoneKVMConfig,
+    PlainAttention,
+    PlainAttentionConfig,
+    flex_forward,
+)
+from .triton import kvm_triton_forward, monotone_triton_forward
 from .model import TinyLM, TinyLMConfig, build_attention
 
 __all__ = [
     "BucketScheduler",
     "LogScheduler",
+    "LogBudgetScheduler",
     "SqrtScheduler",
     "PowerScheduler",
-    "FixedScheduler",
     "LinearScheduler",
     "get_scheduler",
     "simulate",
@@ -42,6 +49,9 @@ __all__ = [
     "KVMConfig",
     "MonotoneKVMAttention",
     "MonotoneKVMConfig",
+    "flex_forward",
+    "monotone_triton_forward",
+    "kvm_triton_forward",
     "PlainAttention",
     "PlainAttentionConfig",
     "TinyLM",

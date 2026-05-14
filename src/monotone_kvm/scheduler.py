@@ -16,20 +16,20 @@ returns `(new_sizes, merge_pair)` where `new_sizes` already has the new
 singleton prepended at index 0 and `merge_pair` is `None` or `(i, i+1)` -- the
 adjacent pair fused (indices into `new_sizes`' pre-merge layout).
 
-The schedule family spans the whole O(state) continuum::
+Every schedule in the family obeys invariant 2 *strictly* -- it only ever fuses
+adjacent **equal-size** buckets. The family spans the O(state) continuum::
 
-    fixed(k)        O(1)             -- linear-attention / SSM end
-    log             O(log t)         -- de-amortized binary carry
-    power(alpha)    O(max(t^a,log t))-- the t**alpha continuum (1/3, 1/2, ...)
-    sqrt            O(sqrt t)        -- power(alpha=1/2)
+    log             O(log t)         -- de-amortized binary carry (no coeff)
+    logbudget(c)    O(c log t)       -- tunable soft-budget log
+    power(alpha,c)  O(max(c t^a,log t))-- the t**alpha continuum (1/3, 1/2, ...)
+    sqrt(c)         O(c sqrt t)      -- power(alpha=1/2)
     linear          O(t)             -- never merges, full-attention end
 
-Note the **O(log t) floor**: with same-size-only adjacent merges (invariant 2)
-you cannot drop below ~bit_length(t) buckets, so `log` is the most aggressive
-*clean dyadic* schedule. `power(alpha)` for small alpha is therefore really
-O(max(t**alpha, log t)). `fixed(k)` breaks below the floor only by giving up
-invariant 2 -- it force-merges the two oldest buckets regardless of size, which
-is the price of a true O(1) cap.
+Note the **O(log t) floor**: with same-size-only adjacent merges you cannot drop
+below ~bit_length(t) buckets, so `log` is the most aggressive schedule in the
+family. `power(alpha)` for small alpha is therefore really O(max(t**alpha,
+log t)). There is no O(1) schedule here: a true constant cap would have to fuse
+*unequal*-size buckets, which invariant 2 forbids -- so the floor stands.
 """
 
 import math
@@ -73,20 +73,6 @@ def merge_one(
             continue
         return sizes[:i] + [a + b] + sizes[i + 2 :], (i, i + 1)
     return sizes, None
-
-
-def force_merge_oldest(sizes: list[int]):
-    """Merge the two oldest buckets regardless of size.
-
-    Used only by fixed-budget schedules: it gives up invariant 2 (same-size
-    merges) -- and hence strict dyadic structure -- in exchange for a true O(1)
-    cap. Invariants 1, 3 and 4 are preserved. Requires >= 3 buckets so the
-    newest (index 0) is never touched.
-    """
-    n = len(sizes)
-    assert n >= 3, "force_merge_oldest needs >=2 non-newest buckets"
-    i = n - 2
-    return sizes[:i] + [sizes[i] + sizes[i + 1]], (i, i + 1)
 
 
 def check_invariants(sizes: list[int]) -> None:
@@ -193,34 +179,35 @@ class SqrtScheduler(PowerScheduler):
         return f"SqrtScheduler(coeff={self.coeff:g})"
 
 
-class FixedScheduler(BucketScheduler):
-    """O(1) buckets: a true constant cap ``k`` -- the linear-attention end.
+class LogBudgetScheduler(SoftBudgetScheduler):
+    """O(coeff * log2 t) buckets -- a *tunable* soft-budget log.
 
-    To stay capped below the O(log t) dyadic floor it force-merges the two
-    oldest buckets when over budget, giving up invariant 2 (same-size merges).
-    Requires ``k >= 2`` so the newest bucket is always safe.
+    `LogScheduler` is the de-amortized binary carry: structurally exactly
+    ``bit_length(t)`` buckets, with the gradual slow-transfer property -- and so
+    it has no `coeff` lever (the dyadic carry *is* the schedule). This is the
+    tunable alternative: a soft-budget schedule (like `PowerScheduler`) whose
+    budget is ``coeff * log2(t)``. It gains a `coeff` knob uniform with
+    power/sqrt, but gives up the dyadic slow-transfer (it merges a newest-side
+    pair on overflow). ``coeff=1`` sits near the O(log t) floor.
     """
 
-    def __init__(self, k: int = 8):
-        assert k >= 2, "fixed schedule needs k >= 2"
-        self.k = int(k)
-        self.name = f"fixed(k={self.k})"
+    def __init__(self, coeff: float = 1.0):
+        self.coeff = float(coeff)
+        self.name = f"logbudget(c={self.coeff:g})"
 
-    def step(self, sizes: list[int], t: int):
-        sizes = [1] + list(sizes)
-        if len(sizes) > self.k:
-            return force_merge_oldest(sizes)
-        return sizes, None
-
-    def expected_count(self, t: int) -> float:
-        return float(min(t, self.k))
+    def budget(self, t: int) -> float:
+        return math.ceil(self.coeff * max(t.bit_length(), 1))
 
     def __repr__(self) -> str:
-        return f"FixedScheduler(k={self.k})"
+        return f"LogBudgetScheduler(coeff={self.coeff:g})"
 
 
 class LinearScheduler(BucketScheduler):
-    """O(t) buckets: never merges -- the full-attention end of the family."""
+    """O(t) buckets: never merges -- the full-attention end of the family.
+
+    Trivially honours invariant 2 (it performs zero merges); it is the
+    no-compression reference, not a real compression schedule.
+    """
 
     name = "linear"
 
@@ -236,16 +223,16 @@ class LinearScheduler(BucketScheduler):
 # --------------------------------------------------------------------------
 _FACTORIES = {
     "log": LogScheduler,
+    "logbudget": LogBudgetScheduler,
     "sqrt": SqrtScheduler,
     "power": PowerScheduler,
-    "fixed": FixedScheduler,
     "linear": LinearScheduler,
 }
 
 
 def get_scheduler(name: str, **kwargs) -> BucketScheduler:
     """Build a scheduler by name. Extra kwargs go to the constructor
-    (e.g. ``get_scheduler("power", alpha=1/3)``, ``get_scheduler("fixed", k=16)``).
+    (e.g. ``get_scheduler("power", alpha=1/3)``, ``get_scheduler("sqrt", coeff=2)``).
     """
     key = name.lower()
     if key not in _FACTORIES:
@@ -253,15 +240,29 @@ def get_scheduler(name: str, **kwargs) -> BucketScheduler:
     return _FACTORIES[key](**kwargs)
 
 
-def simulate(scheduler: BucketScheduler, n_chunks: int) -> list[list[int]]:
-    """Run `scheduler` for `n_chunks` steps, returning the size list per step."""
+def simulate(scheduler: BucketScheduler, n_tokens: int) -> list[list[int]]:
+    """Run `scheduler` for `n_tokens` steps, returning the size list per step.
+
+    The schedule is **token-based**: step `t` folds in one more token, so
+    `history[t-1]` is the bucket-size partition of the first `t` tokens.
+    """
     sizes: list[int] = []
     history: list[list[int]] = []
-    for t in range(1, n_chunks + 1):
+    for t in range(1, n_tokens + 1):
         sizes, _ = scheduler.step(sizes, t)
         check_invariants(sizes)
         history.append(list(sizes))
     return history
+
+
+def intervals(sizes_newest_first: list[int]) -> list[tuple[int, int]]:
+    """Bucket sizes (newest-first token counts) -> contiguous [a, b) token
+    intervals, oldest-first. The intervals tile [0, sum(sizes)) exactly."""
+    out, pos = [], sum(sizes_newest_first)
+    for sz in sizes_newest_first:
+        out.append((pos - sz, pos))
+        pos -= sz
+    return list(reversed(out))
 
 
 if __name__ == "__main__":
@@ -269,7 +270,7 @@ if __name__ == "__main__":
         get_scheduler("log"),
         get_scheduler("sqrt"),
         get_scheduler("power", alpha=1 / 3),
-        get_scheduler("fixed", k=5),
+        get_scheduler("logbudget", coeff=2.0),
         get_scheduler("linear"),
     ]
     for sched in demos:

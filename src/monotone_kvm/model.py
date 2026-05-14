@@ -14,9 +14,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .kvm import KVMAttention, KVMConfig
-from .monotone import MonotoneKVMAttention, MonotoneKVMConfig
-from .plain import PlainAttention, PlainAttentionConfig
+from .attention import (
+    KVMAttention,
+    KVMConfig,
+    MonotoneKVMAttention,
+    MonotoneKVMConfig,
+    PlainAttention,
+    PlainAttentionConfig,
+)
 
 
 @dataclass
@@ -30,6 +35,8 @@ class TinyLMConfig:
 
     # which attention: "plain", "kvm", or "monotone"
     attn: str = "monotone"
+    # forward path: "auto" (Triton kernels when usable), "naive", "triton", "flex"
+    attn_impl: str = "auto"
 
     # shared attention config
     chunk_len: int = 32
@@ -125,11 +132,26 @@ class Block(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(cfg.hidden_size)
         self.attn = build_attention(cfg)
+        self.attn_impl = cfg.attn_impl
         self.ln2 = nn.LayerNorm(cfg.hidden_size)
         self.mlp = MLP(cfg.hidden_size, cfg.mlp_expansion)
 
+    def _attend(self, a):
+        """Dispatch to the configured attention forward path. "auto" uses the
+        Triton kernels when the input + config support them (each module's
+        `forward_auto`), else falls back to the naive recurrence."""
+        impl = self.attn_impl
+        if impl == "auto":
+            fn = getattr(self.attn, "forward_auto", None)
+            return fn(a) if fn is not None else self.attn(a)
+        if impl == "triton":
+            return self.attn.forward_triton(a)
+        if impl == "flex":
+            return self.attn.forward_flex(a)
+        return self.attn(a)  # "naive"
+
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+        x = x + self._attend(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
 
