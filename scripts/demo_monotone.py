@@ -21,12 +21,13 @@ from monotone_kvm import (
 def main():
     torch.manual_seed(0)
 
-    # (1) the schedules: bucket sizes (chunk units), newest-first.
+    # (1) the schedules: bucket sizes in TOKEN units, newest-first. The numbers
+    # are "how many tokens are summarized into this one summary slot".
     for name, kwargs in [
         ("log", {}),
         ("sqrt", {}),
         ("power", {"alpha": 1 / 3}),
-        ("fixed", {"k": 5}),
+        ("logbudget", {"coeff": 2.0}),
     ]:
         sched = get_scheduler(name, **kwargs)
         hist = simulate(sched, 17)
@@ -69,9 +70,11 @@ def main():
         for sizes in model._size_trace:
             check_invariants(sizes)
         label = model.scheduler.name
-        print(f"[{label:13s}] y={tuple(y.shape)}  slots/chunk = {trace}")
         print(
-            f"{'':16s}final buckets (chunk units) = {model._size_trace[-1]}  "
+            f"[{label:13s}] y={tuple(y.shape)}  state slots per query chunk = {trace}"
+        )
+        print(
+            f"{'':16s}final buckets (token counts) = {model._size_trace[-1]}  "
             f"grad_norm={gnorm:.3f}"
         )
 

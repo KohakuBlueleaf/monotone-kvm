@@ -230,7 +230,7 @@ def main():
     p.add_argument(
         "--schedule",
         default="log",
-        help="monotone schedule: log/sqrt/power/fixed/linear",
+        help="monotone schedule: log/logbudget/sqrt/power/linear",
     )
     p.add_argument("--alpha", type=float, default=1 / 3, help="power-schedule exponent")
     p.add_argument("--steps", type=int, default=300)

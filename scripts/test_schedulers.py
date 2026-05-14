@@ -35,11 +35,7 @@ def test_scheduler(name, n=4096, **kwargs):
         ), "log schedule must hold exactly bit_length(t) buckets"
     elif name == "linear":
         assert final == n, "linear schedule must never merge"
-    elif name == "fixed":
-        k = kwargs.get("k", 8)
-        assert max(counts) <= k, f"fixed(k={k}) exceeded its hard cap: {max(counts)}"
-        assert final == min(n, k), f"fixed(k={k}) should settle at min(n,k)"
-    else:  # power / sqrt -- soft budget, floored at the O(log t) dyadic floor
+    else:  # logbudget / power / sqrt -- soft budget, floored at the log-t floor
         floor = n.bit_length()
         ref = max(sched.expected_count(n), floor)
         assert (
@@ -56,11 +52,11 @@ def test_scheduler(name, n=4096, **kwargs):
 def main():
     print("running scheduler invariant tests (n=4096)")
     test_scheduler("log")
+    test_scheduler("logbudget", coeff=2.0)
     test_scheduler("sqrt")
+    test_scheduler("sqrt", coeff=2.0)
     test_scheduler("power", alpha=1 / 3)
     test_scheduler("power", alpha=1 / 4)
-    test_scheduler("fixed", k=8)
-    test_scheduler("fixed", k=32)
     test_scheduler("linear")
     print("all scheduler tests passed.")
 
