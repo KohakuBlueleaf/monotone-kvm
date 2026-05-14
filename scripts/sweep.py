@@ -161,7 +161,7 @@ def main():
             seq_len=args.seq_len,
             lr=args.lr,
             seed=args.seed,
-            log_every=max(1, args.steps // 5),
+            log_every=max(1, args.steps // 20),
             warmup=args.warmup,
         )
 

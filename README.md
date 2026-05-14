@@ -29,6 +29,34 @@ dense softmax pass, no custom kernels.
 `kvm.py` reproduces this faithfully (minus the training backbone, token-shift,
 value-residual, and the KV-cache decode path).
 
+## The monotone idea
+
+A token far in the past rarely needs token-level resolution; the recent context
+does. So compress the *exited* history geometrically — the newest exited token
+stays a singleton, older tokens fuse into buckets that grow the further back you
+look. The `log` schedule, at 63 exited tokens:
+
+```
+newest -> oldest:   [1] [2] [4] [8] [16] [32]      (bucket sizes, sum = 63)
+```
+
+One summary token for the most recent exit, a 2-token summary behind it, then 4,
+8, 16, a 32-token summary for the oldest stretch — each size-`k` bucket is `k`
+original tokens collapsed into one `LN(sum)` key / mean value. A query then sees
+the recent past sharply and the distant past coarsely, with a smooth gradient
+between, at `O(log t)` or `O(sqrt t)` total slots instead of `O(t)`.
+
+In spirit this is what KVM's learned routing *tries* to do — novel tokens get a
+slot, redundant ones get merged. The monotone bet is that you don't need to
+*learn* the partition: a fixed schedule obeying "recent = fine, old = coarse"
+captures most of it. And because the partition is then a pure function of
+position — no data dependence — the whole compressed state is **precomputable**,
+which is exactly what lets `forward_flex` / `forward_triton` build it in parallel
+(a `cumsum`, not a recurrence). The honest tradeoff: a position-only schedule
+can't drop below the `O(log t)` floor without fusing unequal-size buckets (which
+breaks the dyadic structure — see below), whereas KVM's data-dependent routing
+can — at the cost of that precomputability.
+
 ## The monotone variant
 
 We keep KVM's whole *mechanism* — BSWA, sink, partial RoPE, qk-norm, the Means
