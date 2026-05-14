@@ -100,6 +100,46 @@ its dyadic pyramid is built over *tokens* (not chunks), so the reduction is
 | mono-sqrt triton | 0.29 | 1.24 | 3.49 | 6.94 |
 | mono-log / mono-sqrt flex | 0.44 / 0.31 | 3.65 | **14.09** | **55.54** 🔴 |
 
+## Quality — training loss (tiny-stories char-LM)
+
+`scripts/sweep.py`: a fixed `TinyLM` backbone, six attention configs, same
+corpus / seed / minibatches, 4000 steps, seq_len 2048. Final loss = mean of the
+last 100 steps; throughput = mean tok/s over the run (includes the one-time
+Triton compile).
+
+| config | state slots M | final loss | sweep throughput |
+|---|---|---|---|
+| plain | full | 0.074 | 257k tok/s |
+| kvm-256 | 256 | 0.093 | 110k tok/s |
+| kvm-sqrt | 64 | **0.096** | **371k tok/s** |
+| mono-sqrt | 64 | 0.105 | 323k tok/s |
+| mono-logbudget-c2 | 32 | 0.105 | 372k tok/s |
+| mono-log | 16 | 0.105 | 370k tok/s |
+
+* **`kvm-sqrt` is the sweet spot** — near-plain quality (0.096 vs 0.074) at the
+  *highest* training throughput in the sweep (371k tok/s, faster than plain's
+  257k). ⚠ Don't be misled by the forward-speed table above, which shows
+  `kvm-sqrt` at 0.89× at T=32768: that is a worst-case artifact of the M=256
+  forward merge kernel spilling registers at extreme T. At the sequence lengths
+  and budgets real training actually uses, `kvm-sqrt` is among the fastest paths
+  — the sweep throughput is the representative number.
+* **monotone is budget-insensitive** — `mono-log` (M=16), `mono-logbudget-c2`
+  (M=32), `mono-sqrt` (M=64) all land at ~0.105; 4× the state buys nothing. The
+  monotone loss curves also flatten by ~step 1500 while `kvm` and `plain` keep
+  descending — the fixed positional schedule is a ceiling on accessible
+  long-range info, because this corpus's long-range signal is content-addressed
+  (a recurring story subject) and positional coarsening blurs it away.
+* **the budget-matched pair** (`mono-sqrt` vs `kvm-sqrt`, both M=64) isolates
+  the routing decision: learned content-routing (0.096) beats the fixed
+  schedule (0.105) by ~0.009 at *identical* budget.
+
+The honest split: **monotone's contribution is systems** — data-independence →
+precomputable state → the fast, numerically-tight parallel kernels — **not
+quality**. On a content-addressed task KVM's learned routing wins, and it is
+also fast in practice. Caveats: one seed, an easy templated corpus (all losses
+low — differences live in the tail); a harder or more position-structured task
+could shift this.
+
 ## Notes
 
 * 🔴 `mono flex` — the FlexAttention path's token dyadic pyramid blows up in
