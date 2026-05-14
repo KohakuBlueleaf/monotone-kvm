@@ -1,0 +1,23 @@
+# scratch / reference material (kept locally, not tracked)
+temp/
+
+# environments
+.venv/
+venv/
+
+# generated figures
+figures/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
