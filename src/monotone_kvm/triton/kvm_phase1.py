@@ -49,7 +49,18 @@ def _kvm_budget_plan(attn, T, device):
         cur_before.append(cur)
         cur += na
     cur_after = [cb + na for cb, na in zip(cur_before, n_app)]
-    M = max(16, _next_pow2(cur))
+    # M padding strategy:
+    #   - cur <= 128  : SRAM-resident kernel needs `tl.arange(0, M)` over the
+    #                   whole state -> M must be a power of 2.
+    #   - cur >  128  : tiled kernel only `tl.arange(0, MT)` over each tile, so
+    #                   M just needs to be a multiple of the tile width (MT=64).
+    #                   Multiple-of-64 padding wastes ~3-5% of slot-work at most,
+    #                   vs the ~25-30% wasted by next-pow2.
+    MT = 64
+    if cur <= 128:
+        M = max(16, _next_pow2(cur))
+    else:
+        M = max(128, ((cur + MT - 1) // MT) * MT)
 
     bias = torch.full((n_q, M), float("-inf"), dtype=torch.float32)
     for c in range(n_q):
@@ -170,6 +181,161 @@ def _kvm_merge_kernel(
         obase = (bh * n_q + c) * M * D
         tl.store(BK + obase + om[:, None] * D + od[None, :], rk.to(BK.dtype.element_ty))
         tl.store(BV + obase + om[:, None] * D + od[None, :], rv.to(BV.dtype.element_ty))
+
+
+# state-tiled forward for M > 128: the SRAM-resident kernel above spills past
+# M~128 (the [M,D] fp32 state blows the ~99 KB SRAM budget -> Triton spills to
+# local memory -> ~15x slow-down at M=256, impossible at M>=512). This variant
+# keeps the working state (STATE_K/STATE_V/STATE_VLEN) in HBM and tiles every
+# state-spanning op in MT-slot blocks -- 4 passes per chunk: (A) SPLIT score
+# (running max across M tiles), (B) APPEND scatter, (C) MERGE argmax (running
+# max + running argmax across M tiles, same trick the bwd_tiled uses), (D)
+# MERGE scatter + readout LN + write BK/BV + save SK_TRAJ. Math identical to
+# the SRAM-resident kernel; same SAVE_TRAJ semantics for the bwd_tiled.
+@triton.jit
+def _kvm_merge_kernel_tiled(
+    K,
+    V,
+    BK,
+    BV,
+    SK_TRAJ,
+    SVLEN_TRAJ,
+    N_APP,
+    CUR,
+    LN_W,
+    LN_B,
+    STATE_K,  # HBM working state [BH, M, D] fp32
+    STATE_V,
+    STATE_VLEN,  # HBM working state [BH, M] fp32
+    n_q,
+    T: tl.constexpr,
+    CL: tl.constexpr,
+    D: tl.constexpr,
+    M: tl.constexpr,
+    MT: tl.constexpr,
+    RPD: tl.constexpr,
+    SINK: tl.constexpr,
+    EPS: tl.constexpr,
+    SAVE_TRAJ: tl.constexpr,
+):
+    bh = tl.program_id(0)
+    od = tl.arange(0, D)
+    ocl = tl.arange(0, CL)
+    omt = tl.arange(0, MT)
+    n_mt = M // MT
+    in_dtype = K.dtype.element_ty
+    ln_w = tl.load(LN_W + od).to(tl.float32)[None, :]
+    ln_b = tl.load(LN_B + od).to(tl.float32)[None, :]
+    kbase = bh * T * D
+    gbase = bh * M * D
+    vlbase = bh * M
+
+    # working-state buffers (STATE_K/STATE_V/STATE_VLEN) are zero-initialised by
+    # the wrapper (torch.zeros) -- no need to zero them again here.
+
+    for c in range(0, n_q):  # the sequential recurrence
+        row = c * CL
+        n_app = tl.load(N_APP + c)
+        cur = tl.load(CUR + c)
+
+        # prepare_state_k(kc): zero RoPE channels, LayerNorm over D (fp32 stats)
+        kc = tl.load(K + kbase + (row + ocl)[:, None] * D + od[None, :])
+        vc = tl.load(V + kbase + (row + ocl)[:, None] * D + od[None, :])
+        kf = tl.where(od[None, :] < RPD, 0.0, kc.to(tl.float32))
+        kmu = tl.sum(kf, 1) / D
+        kfc = kf - kmu[:, None]
+        krstd = tl.rsqrt(tl.sum(kfc * kfc, 1) / D + EPS)
+        pk = ((kfc * krstd[:, None]) * ln_w + ln_b).to(in_dtype)  # [CL,D]
+
+        # --- PASS A: SPLIT score = max over M (running across M tiles) -------
+        score = tl.full([CL], -float("inf"), tl.float32)
+        for mt in tl.range(0, n_mt):
+            mo = mt * MT + omt
+            sk_t = tl.load(STATE_K + gbase + mo[:, None] * D + od[None, :])
+            smu = tl.sum(sk_t, 1) / D
+            sc = sk_t - smu[:, None]
+            srstd = tl.rsqrt(tl.sum(sc * sc, 1) / D + EPS)
+            skn = (sc * srstd[:, None] * ln_w + ln_b).to(in_dtype)
+            sim = tl.dot(pk, tl.trans(skn))  # [CL, MT] fp32
+            sim = tl.where(mo[None, :] < cur, sim, -float("inf"))
+            score = tl.maximum(score, tl.max(sim, 1))
+        lt = score[None, :] < score[:, None]
+        eq = (score[None, :] == score[:, None]) & (ocl[None, :] < ocl[:, None])
+        rank = tl.sum((lt | eq).to(tl.int32), 1)  # ascending rank [CL]
+        is_append = rank < n_app
+        is_merge = rank >= n_app
+        app_pos = tl.cumsum(is_append.to(tl.int32), 0) - 1
+        route_app = cur + app_pos  # [CL]
+
+        # --- PASS B: APPEND scatter (n_app most-novel -> fresh slots) -------
+        for mt in tl.range(0, n_mt):
+            mo = mt * MT + omt
+            sk_t = tl.load(STATE_K + gbase + mo[:, None] * D + od[None, :])
+            sv_t = tl.load(STATE_V + gbase + mo[:, None] * D + od[None, :])
+            svl_t = tl.load(STATE_VLEN + vlbase + mo)
+            oh_app = (is_append[:, None] & (route_app[:, None] == mo[None, :])).to(
+                in_dtype
+            )
+            sk_t = sk_t + tl.dot(tl.trans(oh_app), pk)
+            sv_t = sv_t + tl.dot(tl.trans(oh_app), vc)
+            svl_t = svl_t + tl.sum(oh_app.to(tl.float32), 0)
+            tl.store(STATE_K + gbase + mo[:, None] * D + od[None, :], sk_t)
+            tl.store(STATE_V + gbase + mo[:, None] * D + od[None, :], sv_t)
+            tl.store(STATE_VLEN + vlbase + mo, svl_t)
+
+        # --- PASS C: MERGE argmax (running max + running argmax) -------------
+        # over the POST-append state, sink-protected, valid slots only.
+        best = tl.full([CL], -float("inf"), tl.float32)
+        route_mrg = tl.zeros([CL], tl.int32)
+        for mt in tl.range(0, n_mt):
+            mo = mt * MT + omt
+            sk_t = tl.load(STATE_K + gbase + mo[:, None] * D + od[None, :])
+            smu = tl.sum(sk_t, 1) / D
+            sc = sk_t - smu[:, None]
+            srstd = tl.rsqrt(tl.sum(sc * sc, 1) / D + EPS)
+            skn = (sc * srstd[:, None] * ln_w + ln_b).to(in_dtype)
+            sim = tl.dot(pk, tl.trans(skn))
+            valid = (mo[None, :] >= SINK) & (mo[None, :] < cur + n_app)
+            sim = tl.where(valid, sim, -float("inf"))
+            tmax = tl.max(sim, 1)
+            targ = mt * MT + tl.argmax(sim, 1).to(tl.int32)
+            better = tmax > best
+            route_mrg = tl.where(better, targ, route_mrg)
+            best = tl.maximum(best, tmax)
+
+        # --- PASS D: MERGE scatter + readout LN + save SK_TRAJ + write BK/BV
+        cbase = (bh * n_q + c) * M * D
+        for mt in tl.range(0, n_mt):
+            mo = mt * MT + omt
+            sk_t = tl.load(STATE_K + gbase + mo[:, None] * D + od[None, :])
+            sv_t = tl.load(STATE_V + gbase + mo[:, None] * D + od[None, :])
+            svl_t = tl.load(STATE_VLEN + vlbase + mo)
+            oh_mrg = (is_merge[:, None] & (route_mrg[:, None] == mo[None, :])).to(
+                in_dtype
+            )
+            sk_t = sk_t + tl.dot(tl.trans(oh_mrg), pk)
+            sv_t = sv_t + tl.dot(tl.trans(oh_mrg), vc)
+            svl_t = svl_t + tl.sum(oh_mrg.to(tl.float32), 0)
+            tl.store(STATE_K + gbase + mo[:, None] * D + od[None, :], sk_t)
+            tl.store(STATE_V + gbase + mo[:, None] * D + od[None, :], sv_t)
+            tl.store(STATE_VLEN + vlbase + mo, svl_t)
+            if SAVE_TRAJ:
+                tl.store(SK_TRAJ + cbase + mo[:, None] * D + od[None, :], sk_t)
+                tl.store(SVLEN_TRAJ + (bh * n_q + c) * M + mo, svl_t)
+            # readout LN (LN(sk) -> bucket key) + value-mean (sv / svlen) -> bucket V
+            rmu = tl.sum(sk_t, 1) / D
+            rc = sk_t - rmu[:, None]
+            rrstd = tl.rsqrt(tl.sum(rc * rc, 1) / D + EPS)
+            rk = rc * rrstd[:, None] * ln_w + ln_b
+            rv = tl.where(svl_t[:, None] > 0, sv_t / svl_t[:, None], 0.0)
+            tl.store(
+                BK + cbase + mo[:, None] * D + od[None, :],
+                rk.to(BK.dtype.element_ty),
+            )
+            tl.store(
+                BV + cbase + mo[:, None] * D + od[None, :],
+                rv.to(BV.dtype.element_ty),
+            )
 
 
 # ----------------------------------------------------------------------
@@ -392,7 +558,7 @@ def _kvm_merge_bwd_tiled_kernel(
 
         # --- PASS 1: SPLIT score = max over M (running across tiles) ---
         score = tl.full([CL], -float("inf"), tl.float32)
-        for mt in range(0, n_mt):
+        for mt in tl.range(0, n_mt):
             mo = mt * MT + omt
             spre = tl.load(SK_TRAJ + pbase + mo[:, None] * D + od[None, :]) * pre0
             smu = tl.sum(spre, 1) / D
@@ -413,7 +579,7 @@ def _kvm_merge_bwd_tiled_kernel(
         # --- PASS 2: MERGE argmax over M of sim(post-append state) ---
         best = tl.full([CL], -float("inf"), tl.float32)
         route_mrg = tl.zeros([CL], tl.int32)
-        for mt in range(0, n_mt):
+        for mt in tl.range(0, n_mt):
             mo = mt * MT + omt
             spre = tl.load(SK_TRAJ + pbase + mo[:, None] * D + od[None, :]) * pre0
             oh_app = (is_append[:, None] & (route_app[:, None] == mo[None, :])).to(
@@ -436,7 +602,7 @@ def _kvm_merge_bwd_tiled_kernel(
         # --- PASS 3: gradient scatter + state-grad carry ---
         d_pk = tl.zeros([CL, D], tl.float32)
         d_vc = tl.zeros([CL, D], tl.float32)
-        for mt in range(0, n_mt):
+        for mt in tl.range(0, n_mt):
             mo = mt * MT + omt
             tb = cbase + mo[:, None] * D + od[None, :]
             sk_c = tl.load(SK_TRAJ + tb)
@@ -503,29 +669,61 @@ class _KVMPhase1(torch.autograd.Function):
             svlen_traj = torch.empty(BH, n_q, M, device=k.device, dtype=torch.float32)
         else:
             sk_traj = svlen_traj = k  # unused dummy (SAVE_TRAJ=False)
-        _kvm_merge_kernel[(BH,)](
-            k,
-            v,
-            buck_k,
-            buck_v,
-            sk_traj,
-            svlen_traj,
-            n_app,
-            cur_before,
-            ln_w_c,
-            ln_b_c,
-            n_q,
-            T=T,
-            CL=CL,
-            D=D,
-            M=M,
-            RPD=RPD,
-            SINK=SINK,
-            EPS=eps,
-            SAVE_TRAJ=save,
-            num_warps=4,
-            num_stages=1,
-        )
+        if M <= 128:  # SRAM-resident fast path: state in registers
+            _kvm_merge_kernel[(BH,)](
+                k,
+                v,
+                buck_k,
+                buck_v,
+                sk_traj,
+                svlen_traj,
+                n_app,
+                cur_before,
+                ln_w_c,
+                ln_b_c,
+                n_q,
+                T=T,
+                CL=CL,
+                D=D,
+                M=M,
+                RPD=RPD,
+                SINK=SINK,
+                EPS=eps,
+                SAVE_TRAJ=save,
+                num_warps=4,
+                num_stages=1,
+            )
+        else:  # state-tiled, HBM-carried (M=256 ... arbitrary)
+            state_k = torch.zeros(BH, M, D, device=k.device, dtype=torch.float32)
+            state_v = torch.zeros(BH, M, D, device=k.device, dtype=torch.float32)
+            state_vlen = torch.zeros(BH, M, device=k.device, dtype=torch.float32)
+            _kvm_merge_kernel_tiled[(BH,)](
+                k,
+                v,
+                buck_k,
+                buck_v,
+                sk_traj,
+                svlen_traj,
+                n_app,
+                cur_before,
+                ln_w_c,
+                ln_b_c,
+                state_k,
+                state_v,
+                state_vlen,
+                n_q,
+                T=T,
+                CL=CL,
+                D=D,
+                M=M,
+                MT=min(64, M),
+                RPD=RPD,
+                SINK=SINK,
+                EPS=eps,
+                SAVE_TRAJ=save,
+                num_warps=4,
+                num_stages=1,
+            )
         if save:
             ctx.save_for_backward(
                 k, v, ln_w, ln_b, sk_traj, svlen_traj, n_app, cur_before
@@ -640,11 +838,8 @@ def kvm_merge_forward(attn, k, v):
     ), "Triton KVM v2: use_vlens / use_merge_gate / use_head_temps must be off"
     plan = _kvm_budget_plan(attn, T, k.device)
     n_q, M = plan["n_q"], plan["M"]
-    assert M <= 256, (
-        f"Triton KVM v2: final state budget M={M} exceeds 256. The merge kernel "
-        f"carries the state in registers; M>256 would need a state-tiled kernel. "
-        f"(M=128/256 run but Triton spills the carried state to local memory.)"
-    )
+    # M<=128: SRAM-resident fast path. M>128: state-tiled (HBM state, MT=32 tiles).
+    # No upper bound -- the tiled kernel scales to arbitrary M (memory permitting).
 
     k_ = k.reshape(B * H, T, D)
     v_ = v.reshape(B * H, T, D)

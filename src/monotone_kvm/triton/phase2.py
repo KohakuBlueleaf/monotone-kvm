@@ -1,5 +1,11 @@
 """PHASE 2 -- the shared chunked-attention Triton kernels (forward + backward).
 
+Note on BLOCK_M: the M-tile loop is `for m0 in static_range(0, M, BLOCK_M)`, so
+BLOCK_M must divide M. M is either a power of 2 (monotone path) or a multiple
+of 64 (KVM tiled path). `_pick_block_m` picks the largest valid divisor up to
+128.
+
+
 Both KVM and monotone-KVM decompose into PHASE 1 (build the compressed state)
 and PHASE 2 (chunked attention). PHASE 2 is this kernel set; PHASE 1 lives in
 `monotone_phase1.py` / `kvm_phase1.py`.
@@ -18,6 +24,15 @@ import triton
 import triton.language as tl
 
 
+def _pick_block_m(M):
+    """BLOCK_M must divide M. Prefer 128 when possible; else 64; else M."""
+    if M >= 128 and M % 128 == 0:
+        return 128
+    if M >= 64 and M % 64 == 0:
+        return 64
+    return M
+
+
 # ======================================================================
 # PHASE 2 forward kernel
 # ======================================================================
@@ -27,7 +42,7 @@ import triton.language as tl
         for w in (2, 4, 8)
         for s in (2, 3, 4)
     ],
-    key=["n_qchunks", "T", "M", "D"],  # D affects SRAM -> must be in the key
+    key=["n_qchunks", "T", "M", "D"],
 )
 @triton.jit
 def _phase2_fwd_kernel(
@@ -48,13 +63,13 @@ def _phase2_fwd_kernel(
     WIN: tl.constexpr,
     D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
     ci = tl.program_id(0)  # query chunk
     bh = tl.program_id(1)  # batch * head
 
     offs_cl = tl.arange(0, CL)
     offs_d = tl.arange(0, D)
-    offs_m = tl.arange(0, M)
 
     # loads stay in the input dtype so the matmuls run on fp16/bf16 tensor
     # cores; the softmax accumulators are fp32. (input_precision="ieee" is
@@ -67,18 +82,23 @@ def _phase2_fwd_kernel(
     l_i = tl.zeros([CL], tl.float32)
     acc = tl.zeros([CL, D], tl.float32)
 
-    # --- segment 1: compressed state (sink prepended), M rows ---
+    # --- segment 1: compressed state (sink prepended), tiled over M.
+    # Flash-attention online-softmax accumulator: per BLOCK_M tile, update
+    # (m_i, l_i, acc) using the running max trick. Lets M grow unboundedly
+    # (was a single load of the whole [M,D] state -- SRAM-blew at M>=1024).
     base = (bh * n_qchunks + ci) * M * D
-    bk = tl.load(BK + base + offs_m[:, None] * D + offs_d[None, :])
-    bv = tl.load(BV + base + offs_m[:, None] * D + offs_d[None, :])
-    bias = tl.load(BIAS + ci * M + offs_m).to(tl.float32)  # [M], -inf = pad
-    qk = tl.dot(q, tl.trans(bk)) * scale + bias[None, :]
-    m_ij = tl.maximum(m_i, tl.max(qk, 1))
-    p = tl.exp(qk - m_ij[:, None])
-    alpha = tl.exp(m_i - m_ij)
-    l_i = l_i * alpha + tl.sum(p, 1)
-    acc = acc * alpha[:, None] + tl.dot(p.to(bv.dtype), bv)
-    m_i = m_ij
+    for m0 in tl.static_range(0, M, BLOCK_M):
+        offs_m = m0 + tl.arange(0, BLOCK_M)
+        bk = tl.load(BK + base + offs_m[:, None] * D + offs_d[None, :])
+        bv = tl.load(BV + base + offs_m[:, None] * D + offs_d[None, :])
+        bias = tl.load(BIAS + ci * M + offs_m).to(tl.float32)  # -inf = pad
+        qk = tl.dot(q, tl.trans(bk)) * scale + bias[None, :]
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.exp(qk - m_ij[:, None])
+        alpha = tl.exp(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(bv.dtype), bv)
+        m_i = m_ij
 
     # --- segment 2: sliding window of raw tokens, causal ---
     # window = [win_begin, win_begin + WIN); win_begin derivable from ci.
@@ -123,8 +143,8 @@ def _phase2_bwd_preprocess(O, DO, DELTA, n_qchunks, CL: tl.constexpr, D: tl.cons
     tl.store(DELTA + (bh * n_qchunks + ci) * CL + offs_cl, tl.sum(o * do, axis=1))
 
 
-# the state segment materialises [CL,M] + [M,D] fp32 tiles -- SRAM-heavy at
-# large M (e.g. M=256), so num_stages is capped low and D is in the key.
+# the state segment materialises [CL,BLOCK_M] + [BLOCK_M,D] fp32 tiles each
+# step -- SRAM-heavy at large M (e.g. M=256), so num_stages is capped low.
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=w, num_stages=s) for w in (2, 4, 8) for s in (1, 2)
@@ -329,6 +349,7 @@ class _Phase2(torch.autograd.Function):
             WIN=win,
             D=D,
             BLOCK_N=CL,
+            BLOCK_M=_pick_block_m(M),
         )
         ctx.save_for_backward(q_chunks, buck_k, buck_v, buck_bias, raw_k, raw_v, o, L)
         ctx.front, ctx.win, ctx.scale = front, win, scale
@@ -372,7 +393,7 @@ class _Phase2(torch.autograd.Function):
             WIN=win,
             D=D,
             BLOCK_N=CL,
-            BLOCK_M=min(M, 128),
+            BLOCK_M=_pick_block_m(M),
         )
 
         # raw columns [0, CL) are never inside a PHASE 2 window -> stay zero.
