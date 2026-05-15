@@ -28,6 +28,7 @@ python scripts/test_schedulers.py  # invariant tests for every schedule
 python scripts/train_demo.py       # tiny char-LM: KVM vs monotone
 python scripts/sweep.py            # plain / kvm / monotone loss-curve comparison
 python scripts/bench_flex.py       # recurrent vs FlexAttention prefill: precision + speed
+python scripts/bench_comprehensive.py  # full sweep: all variants × T × coeffs → bench_report.md
 python scripts/viz_buckets.py      # plots: monotone schedules vs KVM's budgets
 ```
 
@@ -157,19 +158,27 @@ and RoPE live inside `forward`, so `TinyLM` treats them as ordinary layers.
 
 ## Results
 
-**Speed** (RTX 5060 Ti, bf16, T=32768 — full tables in [`bench.md`](bench.md)):
+**Speed** (RTX 5060 Ti, bf16, T=32768 — full tables and coeff sweep in
+[`bench.md`](bench.md)):
 
-| vs plain attention @ T=32768 | forward | fwd + bwd (training) |
-|---|---|---|
-| `monotone triton` (`mono-log`)  | **6.6×** | **10.4×** |
-| `monotone triton` (`mono-sqrt`) | **4.5×** | **5.3×** |
-| `kvm triton` (`kvm-power`)       | **5.1×** | **4.1×** |
+| vs plain attention @ T=32768 | live M | forward | fwd + bwd (training) |
+|---|---|---|---|
+| `monotone triton` (`mono-log`)        | 16 (flat) | **6.24×** | **7.22×** |
+| `monotone triton` (`mono-logbudget-c2`) | 31 (flat) | **6.06×** | **7.04×** |
+| `kvm triton` (`kvm-sqrt c=1`)         | 180 | **4.04×** | **6.60×** |
+| `kvm triton` (`kvm-256`, fixed)       | 256 | **3.55×** | **4.23×** |
+| `monotone triton` (`mono-sqrt c=1`)   | 182 | **4.22×** | **3.84×** |
 
-A query attends over only `live + window` positions — `mono-log` at T=32768
-attends over ~80 of 32768 (a flat **16** live state slots, **410×** compression).
-`live` is measured from the PHASE-2 bias mask the kernel actually reads and
-cross-checked against the exact recurrence; the Triton path matches the naive
-reference to the TF32 floor in forward *and* backward.
+Coefficient sweep takeaway: with the official KVM-sqrt budget `c·sqrt(t)`,
+**`c=1` is the speed sweet spot** at long context (4-6× on this card). Higher
+`c` walks down the speed table — the paper's headline `c=16` config is the
+slowest path here (0.23× fwd / 0.36× e2e at T=8192) and OOMs past T≥32768 on a
+16 GB card. `mono-log` wins outright when budget is unconstrained (M stays
+flat at 16 regardless of T → **410× compression** at T=32768). `live` =
+attended state slots; the new tiled forward pads to multiples of 64 instead of
+pow2, saving ~25-30% of slot-work at the upper end of each bracket. The
+Triton path matches the naive reference to the TF32 floor in forward *and*
+backward.
 
 **Quality** — `scripts/sweep.py`, a fixed `TinyLM` backbone, six configs, same
 corpus / seed, 4000 steps, seq_len 2048 (final loss = mean of the last 100
@@ -191,10 +200,9 @@ long-range info, because this corpus's long-range signal is content-addressed (a
 recurring story subject) and positional coarsening blurs it away. (2) **KVM's
 learned routing wins at matched budget** — `kvm-sqrt` (0.096) beats `mono-sqrt`
 (0.105) at the same 64 slots, *and* trains at the highest throughput in the
-sweep. (The forward-only benchmark shows `kvm-sqrt` at 0.89× at T=32768 — a
-worst-case artifact of the M=256 forward merge kernel spilling at extreme T; at
-the lengths and budgets real training uses it is among the fastest paths, as the
-371k tok/s shows.)
+sweep. With the new state-tiled forward kernel `kvm-sqrt c=1` also lands among
+the fastest training paths at long context (**6.60× e2e at T=32768**), so the
+old M=256 forward register-spill caveat is gone.
 
 So the split is clean: **monotone's contribution is the fast, precomputable
 kernels; KVM's learned routing currently owns quality.** Which makes "explore

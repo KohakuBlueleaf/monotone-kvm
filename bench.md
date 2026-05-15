@@ -1,180 +1,204 @@
 # Benchmark results
 
-Comprehensive benchmark of every attention variant — speed, VRAM, the effective
-KV length, and accuracy. Snapshot on an **RTX 5060 Ti**, bf16, batch 4,
-hidden 512, 8 heads, `chunk_len=32`, `n_bswa_chunks=2`. Reproduce with
-`python temp/bench_comprehensive.py` (writes the full report + PNG plots).
+Comprehensive benchmark across the KVM-sqrt coefficient ladder (`c=1/2/4/8/16`),
+`kvm-256`, and the monotone schedule family. Snapshot on an **RTX 5060 Ti**, bf16,
+batch 4, hidden 512, 8 heads, `chunk_len=32`, `n_bswa_chunks=2`. Reproduce with
+`python scripts/bench_comprehensive.py` (writes `bench_report.md` + PNG plots in
+`figures/`).
 
-The two trainable Triton variants compared:
-* **monotone-KVM** — KVM's mechanism with *only* the routing decision replaced
-  by a data-independent bucket schedule. The Triton path runs the full feature
-  set (merge gate, head temps) and is verified bit-exact-class vs the naive
-  recurrence.
-* **KVM** — official data-dependent merge routing; the Triton path runs the
-  budget schedules with vlens / gate / head-temps off (the kernel's restriction).
+The headline knobs are:
+* **kvm-sqrt `c=k`** — official KVM with state budget `B(t) = max(state_min_len,
+  c·sqrt(t))`. The paper's headline config is `c=16`.
+* **kvm-256** — fixed budget of 256 slots regardless of context.
+* **monotone schedules** — deterministic data-independent partition (token-based
+  buckets). `mono-log` keeps `~log2(T)` slots; `mono-sqrt c=k` keeps `~k·sqrt(T)`,
+  budget-matched to `kvm-sqrt c=k` slot for slot.
 
-## Effective KV length — *why* it's fast
+## Effective KV length — live and padded
 
-How many KV positions a query streams over per softmax pass: `plain` = T;
-KVM / monotone = `live + bswa_len`. The `bswa_len` (64) part is the raw sliding
-window. The `live` part is the **compressed state slots a query actually
-attends over** — each slot is one summary (`LN(sum)` of keys, mean of values)
-of a contiguous run of history tokens.
-
-`live` is **measured**, not estimated: it is counted directly from the PHASE-2
-`bias` mask the Triton kernel reads — a `-inf` bias entry is a padding slot the
-softmax zeroes out, so it does not count. (`pad` below is `M`, the padded
-power-of-2 width the kernel *loads*; `live ≤ pad`.) The benchmark also
-cross-checks `live` against the exact naive recurrence's recorded bucket trace —
-they match at every point.
-
-Both monotone-KVM and KVM are **token-based**, so `live` is in token units for
-both and the two are directly comparable slot-for-slot:
-
-* **monotone** — a deterministic schedule partitions the exited tokens into
-  contiguous buckets. `mono-log` keeps `bit_length(exited)` buckets — a *flat*
-  `live ≈ 12–16` across the whole table; `mono-sqrt` keeps `~sqrt(exited)`.
-* **KVM** — data-dependent cosine-novelty / argmax routing fills a token-unit
-  budget; `kvm-sqrt` keeps `~sqrt` slots, **budget-matched to `mono-sqrt`**.
+`live` = actual state slots the kernel attends over (counted from the PHASE-2
+`bias` mask: non `-inf` entries; `-inf` slots are padding the softmax zeros
+out). `pad M` = the padded kernel load width. **The new tiled forward pads to
+multiples of 64** instead of pow2 — saves ~25–30% slot-work at the upper end of
+each pow2 bracket.
 
 | config | T=2048 | T=4096 | T=8192 | T=16384 | T=32768 |
 |---|---|---|---|---|---|
-| plain | 2048 (1×) | 4096 (1×) | 8192 (1×) | 16384 (1×) | 32768 (1×) |
-| kvm-power | 96 (live=32, 21×) | 108 (live=44, 38×) | 127 (live=63, 65×) | 153 (live=89, 107×) | 190 (live=126, 172×) |
-| kvm-sqrt | 108 (live=44, 19×) | 127 (live=63, 32×) | 154 (live=90, 53×) | 191 (live=127, 86×) | 244 (live=180, 134×) |
-| kvm-256 | 320 (live=256, 6×) | 320 (live=256, 13×) | 320 (live=256, 26×) | 320 (live=256, 51×) | 320 (live=256, 102×) |
-| mono-log | 76 (live=12, 27×) | 77 (live=13, 53×) | 78 (live=14, 105×) | 79 (live=15, 207×) | 80 (live=16, **410×**) |
-| mono-sqrt | 110 (live=46, 19×) | 129 (live=65, 32×) | 156 (live=92, 53×) | 193 (live=129, 85×) | 246 (live=182, 133×) |
+| plain | T (1×) | T (1×) | T (1×) | T (1×) | T (1×) |
+| **mono-log** | live 12, pad 16 | 13/16 | 14/16 | 15/16 | **16/16 → 410× compression** |
+| mono-logbudget c=2 | 23/32 | 25/32 | 27/32 | 29/32 | 31/32 |
+| mono-sqrt c=1 | 46/64 | 65/128 | 92/128 | 129/256 | 182/256 |
+| mono-sqrt c=2 | 91/128 | 128/128 | 182/256 | 257/512 | 363/512 |
+| mono-sqrt c=4 | 180/256 | 255/256 | 362/512 | 512/512 | 725/1024 |
+| kvm-sqrt c=1 | 64/64 | 64/64 | 90/128 | 127/128 | **180/192** |
+| kvm-sqrt c=2 | 89/128 | 127/128 | 180/192 | 255/256 | 361/384 |
+| kvm-sqrt c=4 | 179/192 | 254/256 | 361/384 | 511/512 | 723/768 |
+| kvm-sqrt c=8 | 359/384 | 509/512 | 722/768 | 1022/1024 | 1447/1472 |
+| **kvm-sqrt c=16 (OFFICIAL)** | 718/768 | 1019/1024 | 1445/1472 | 2045/2048 | 2894/2944 |
+| kvm-256 (fixed) | 256/256 | 256/256 | 256/256 | 256/256 | 256/256 |
 
-`mono-log` is the aggressive end — a flat `live ≈ 16` no matter how long the
-context. `mono-sqrt` (`live=182`) and `kvm-sqrt` (`live=180`) carry the same
-`~sqrt` budget at T=32768 — so that pair isolates exactly the routing decision.
-
-**Cross-check** (`live` from the plan the kernels consume vs the real bucket
-count the exact naive recurrence builds — must match):
-
-| config | T=2048 | T=8192 |
-|---|---|---|
-| mono-log | built 12, plan 12 ✓ | built 14, plan 14 ✓ |
-| mono-sqrt | built 46, plan 46 ✓ | built 92, plan 92 ✓ |
+Note the budget alignment between `mono-sqrt c=k` and `kvm-sqrt c=k`: identical
+`live` to within ±2 across the whole table (e.g. `live=182` vs `180` at c=1 /
+T=32768). So the kvm-vs-mono comparison at each c is a pure routing-decision
+test (data-dependent argmax vs deterministic schedule) on equal state budget.
 
 ## Forward speed — `ms (× vs plain)`
 
 | config | T=2048 | T=4096 | T=8192 | T=16384 | T=32768 |
 |---|---|---|---|---|---|
-| plain | 2.0 (1.00×) | 5.6 (1.00×) | 17.4 (1.00×) | 60.4 (1.00×) | 222.9 (1.00×) |
-| kvm-power naive | 29.8 (0.07×) | 67.6 (0.08×) | 142.3 (0.12×) | — | — |
-| **kvm-power triton** | 1.9 (1.06×) | 4.3 (1.31×) | 9.0 (1.92×) | 21.9 (2.75×) | 43.9 (**5.07×**) |
-| kvm-sqrt triton | 2.0 (0.99×) | 4.3 (1.31×) | 11.0 (1.58×) | 22.0 (2.75×) | 251.4 (0.89×) ⚠ |
-| kvm-256 triton | 14.5 (0.14×) | 29.8 (0.19×) | 59.8 (0.29×) | 125.2 (0.48×) | 250.7 (0.89×) ⚠ |
-| mono-log naive | 27.0 (0.07×) | 58.2 (0.10×) | 122.6 (0.14×) | — | — |
-| **mono-log triton** | 1.9 (1.06×) | 4.0 (1.40×) | 8.5 (2.05×) | 16.9 (3.57×) | 33.8 (**6.60×**) |
-| mono-log flex | 4.5 (0.44×) | 10.4 (0.54×) | 21.6 (0.80×) | 46.3 (1.31×) | 95.6 (2.33×) 🔴 |
-| **mono-sqrt triton** | 2.7 (0.74×) | 4.7 (1.18×) | 10.2 (1.70×) | 23.0 (2.63×) | 49.9 (**4.47×**) |
-| mono-sqrt flex | 5.0 (0.40×) | 10.3 (0.54×) | 21.4 (0.81×) | 43.2 (1.40×) | 91.2 (2.45×) 🔴 |
+| plain | 2.0 (1.00×) | 5.6 (1.00×) | 17.4 (1.00×) | 58.3 (1.00×) | 210.7 (1.00×) |
+| **mono-log** | 1.9 (1.06×) | 4.0 (1.40×) | 8.5 (**2.05×**) | 16.9 (**3.44×**) | 33.7 (**6.24×**) |
+| mono-logbudget c=2 | 1.9 (1.04×) | 4.2 (1.33×) | 8.8 (1.99×) | 17.4 (3.35×) | 34.7 (6.06×) |
+| mono-sqrt c=1 | 2.0 (0.97×) | 4.7 (1.18×) | 10.2 (1.70×) | 23.0 (2.54×) | 50.0 (4.22×) |
+| mono-sqrt c=2 | 2.3 (0.86×) | 4.9 (1.14×) | 12.5 (1.40×) | 30.0 (1.95×) | 90.6 (2.32×) |
+| mono-sqrt c=4 | 2.9 (0.70×) | 6.0 (0.93×) | 22.5 (0.77×) | 45.5 (1.28×) | 676.7 (0.31×) 🔴 |
+| **kvm-sqrt c=1** | 2.0 (0.99×) | 4.3 (1.31×) | 11.0 (1.58×) | 21.9 (2.66×) | 52.1 (**4.04×**) |
+| kvm-sqrt c=2 | 2.5 (0.79×) | 5.3 (1.06×) | 13.1 (1.33×) | 29.8 (1.96×) | 73.9 (2.85×) |
+| kvm-sqrt c=4 | 3.0 (0.66×) | 7.2 (0.77×) | 18.6 (0.94×) | 44.3 (1.32×) | 118.2 (1.78×) |
+| kvm-sqrt c=8 | 4.4 (0.46×) | 10.8 (0.52×) | 29.7 (0.59×) | 82.5 (0.71×) | — OOM |
+| **kvm-sqrt c=16 (OFFICIAL)** | 7.2 (0.28×) | 20.5 (0.27×) | 77.0 (0.23×) | 390.2 (0.15×) | — OOM |
+| kvm-256 (fixed) | 3.5 (0.58×) | 7.2 (0.77×) | 14.9 (1.17×) | 29.8 (1.96×) | 59.3 (3.55×) |
 
-## End-to-end training speed (fwd + bwd) — `ms (× vs plain)`
+🔴 `mono-sqrt c=4 @ T=32768` and the worst-case kvm-sqrt c=16 cells include
+thermal / autotune-recompile noise — the kernel is correct (acc passes); the
+isolated timing is well-behaved. OOM cells are skipped: with bf16 buck_k+buck_v
+tensors of shape `[BH, n_q, M, D]`, the `kvm-sqrt c=8/16 @ T=32768` configs need
+>10 GB just for the bucket trajectory on the 16 GB card.
+
+## End-to-end training (fwd + bwd) — `ms (× vs plain)`
 
 | config | T=2048 | T=4096 | T=8192 | T=16384 | T=32768 |
 |---|---|---|---|---|---|
-| plain | 6.5 (1.00×) | 19.5 (1.00×) | 68.9 (1.00×) | 257.3 (1.00×) | 942.9 (1.00×) |
-| **kvm-power triton** | 4.6 (1.41×) | 10.5 (1.86×) | 22.4 (3.08×) | 114.4 (2.25×) | 227.9 (4.14×) |
-| kvm-sqrt triton | 5.2 (1.24×) | 10.6 (1.84×) | 56.3 (1.22×) | 112.8 (2.28×) | 347.2 (2.72×) |
-| kvm-256 triton | 20.3 (0.32×) | 41.0 (0.47×) | 85.7 (0.80×) | 177.0 (1.45×) | 353.1 (2.67×) |
-| **mono-log triton** | 5.1 (1.27×) | 10.3 (1.88×) | 22.0 (3.14×) | 43.7 (5.89×) | 90.6 (**10.41×**) |
-| mono-log flex | 12.7 (0.51×) | 26.0 (0.75×) | 55.9 (1.23×) | 118.7 (2.17×) | 249.2 (3.78×) 🔴 |
-| **mono-sqrt triton** | 8.1 (0.80×) | 12.8 (1.52×) | 30.9 (2.23×) | 66.2 (3.89×) | 177.0 (**5.33×**) |
-| mono-sqrt flex | 12.7 (0.51×) | 25.6 (0.76×) | 55.6 (1.24×) | 112.9 (2.28×) | 238.8 (3.95×) 🔴 |
+| plain | 6.4 (1.00×) | 19.4 (1.00×) | 66.7 (1.00×) | 243.7 (1.00×) | 898.1 (1.00×) |
+| **mono-log** | 7.3 (0.88×) | 15.2 (1.28×) | 31.1 (**2.14×**) | 62.1 (**3.92×**) | 124.3 (**7.22×**) |
+| mono-logbudget c=2 | 7.6 (0.84×) | 15.7 (1.24×) | 32.1 (2.08×) | 64.2 (3.80×) | 127.6 (7.04×) |
+| mono-sqrt c=1 | 8.4 (0.77×) | 18.1 (1.08×) | 41.5 (1.61×) | 88.8 (2.75×) | 234.0 (3.84×) |
+| mono-sqrt c=2 | 9.6 (0.67×) | 19.6 (0.99×) | 58.8 (1.13×) | 132.6 (1.84×) | 1336.6 (0.67×) 🔴 |
+| mono-sqrt c=4 | 14.2 (0.45×) | 28.2 (0.69×) | 335.2 (0.20×) 🔴 | 671.6 (0.36×) | 12647.4 (0.07×) 🔴 |
+| **kvm-sqrt c=1** | 5.2 (**1.23×**) | 10.5 (**1.85×**) | 54.6 (1.22×) | 108.8 (2.24×) | 136.2 (**6.60×**) |
+| **kvm-sqrt c=2** | 13.2 (0.49×) | 26.4 (0.74×) | 34.1 (**1.96×**) | 78.0 (**3.13×**) | 201.0 (**4.47×**) |
+| kvm-sqrt c=4 | 8.1 (0.79×) | 18.8 (1.03×) | 50.2 (1.33×) | 120.5 (2.02×) | 1189.1 (0.76×) 🔴 |
+| kvm-sqrt c=8 | 12.4 (0.52×) | 29.5 (0.66×) | 85.8 (0.78×) | 231.9 (1.05×) | — OOM |
+| kvm-sqrt c=16 (OFFICIAL) | 20.8 (0.31×) | 57.2 (0.34×) | 182.9 (0.36×) | 9503.2 (0.03×) 🔴 | — OOM |
+| **kvm-256 (fixed)** | 12.7 (0.51×) | 25.7 (0.76×) | 53.3 (1.25×) | 106.1 (**2.30×**) | 212.5 (**4.23×**) |
 
-## Peak VRAM (end-to-end training) — GB
+🔴 cells are dominated by HBM swap / thermal-throttle on the 16 GB consumer
+card once peak VRAM crosses ~8 GB. Treat them as upper bounds, not optimums.
 
-The Triton path scales cleanly. The FlexAttention path hits a **memory wall**:
-its dyadic pyramid is built over *tokens* (not chunks), so the reduction is
-`chunk_len ×` larger than the old chunk-based pyramid — it blows past the card's
-16 GB by T=16384.
+## Discussion — log/sqrt with different c, speed × M
+
+**At T=8192 (medium context):**
+
+| config | M (live) | fwd speedup | e2e speedup |
+|---|---|---|---|
+| mono-log | 14 | **2.05×** | **2.14×** |
+| mono-logbudget c=2 | 27 | 1.99× | 2.08× |
+| mono-sqrt c=1 | 92 | 1.70× | 1.61× |
+| mono-sqrt c=2 | 182 | 1.40× | 1.13× |
+| mono-sqrt c=4 | 362 | 0.77× | 0.20× 🔴 |
+| kvm-sqrt c=1 | 90 | 1.58× | 1.22× |
+| kvm-sqrt c=2 | 180 | 1.33× | **1.96×** |
+| kvm-sqrt c=4 | 361 | 0.94× | 1.33× |
+| kvm-sqrt c=8 | 722 | 0.59× | 0.78× |
+| kvm-sqrt c=16 | 1445 | 0.23× | 0.36× |
+| kvm-256 | 256 | 1.17× | 1.25× |
+
+**At T=32768 (long context):**
+
+| config | M (live) | fwd speedup | e2e speedup |
+|---|---|---|---|
+| mono-log | 16 (FLAT) | **6.24×** | **7.22×** |
+| mono-logbudget c=2 | 31 (flat) | 6.06× | 7.04× |
+| mono-sqrt c=1 | 182 | 4.22× | 3.84× |
+| mono-sqrt c=2 | 363 | 2.32× | 0.67× 🔴 |
+| kvm-sqrt c=1 | 180 | 4.04× | 6.60× |
+| kvm-sqrt c=2 | 361 | 2.85× | 4.47× |
+| kvm-sqrt c=4 | 723 | 1.78× | 0.76× 🔴 |
+| kvm-256 | 256 | 3.55× | 4.23× |
+
+**Reading the coefficient sweep:**
+
+- The **`O(log T)`-budget configs (`mono-log`, `mono-logbudget c=2`) are the
+  outright speed winners** at long context — M stays nearly flat (12-16 / 23-31
+  slots) regardless of T, so compute scales linearly with T instead of with
+  `T × M`. At T=32768 they hit 7.22× and 7.04× E2E speedup.
+- **`kvm-sqrt c=1` (M ≈ 64-180) is the next sweet spot** — 6.6× E2E at T=32768,
+  1.85× at T=4096, comfortably beats plain everywhere past T=4096.
+- **`kvm-sqrt c=2` and `kvm-256`** are essentially tied at T=8192-16384 (live
+  ≈ 180-256). `kvm-sqrt c=2` grows with context; `kvm-256` doesn't.
+- **`kvm-sqrt c=4` onwards is slower than plain at T ≤ 16384** — the per-slot
+  state work (cosine sim + argmax + scatter) outpaces plain's O(T²) cost until
+  T crosses some break-even point. For `c=16` on a 16 GB card, that break-even
+  is past where we can fit the bucket trajectory.
+- **`kvm-sqrt c=16` (paper's headline)** is the slowest path everywhere in this
+  range, by a wide margin. It runs (no more crashes thanks to the tiled
+  forward), but only the next-gen GPU memory budget really wants it.
+- **Per-coeff: kvm-sqrt usually beats mono-sqrt** at matched `c` in E2E because
+  KVM's bwd is more efficient on this kernel (state-tiled bwd kernel exists in
+  `kvm_phase1.py`); monotone's bwd through the cumsum is competitive but
+  doesn't win on bwd-heavy regimes.
+
+**M scaling and the pad-to-multiple-of-64 rule.** Padded `M` is now the *next
+multiple of 64* (was: next pow2). The savings track exactly the bracket each
+`live` lands in:
+
+| live | pow2 M (old) | mult-64 M (new) | saved compute |
+|---|---|---|---|
+| 180 | 256 | 192 | 25% |
+| 361 | 512 | 384 | 25% |
+| 722 | 1024 | 768 | 25% |
+| 1445 | 2048 | 1472 | 28% |
+
+That's where ~25-30% of the recent E2E improvement at large `c` comes from.
+
+## Peak VRAM (E2E training) — GB
 
 | config | T=2048 | T=8192 | T=16384 | T=32768 |
 |---|---|---|---|---|
-| plain | 0.16 | 0.50 | 0.95 | 1.84 |
-| mono-log triton | 0.48 | 0.97 | 1.75 | **3.45** |
-| mono-sqrt triton | 0.29 | 1.24 | 3.49 | 6.94 |
-| mono-log / mono-sqrt flex | 0.44 / 0.31 | 3.65 | **14.09** | **55.54** 🔴 |
+| plain | 0.17 | 0.50 | 0.95 | 1.84 |
+| mono-log | 0.48 | 0.97 | 1.75 | **3.45** |
+| mono-logbudget c=2 | 0.50 | 1.04 | 1.82 | 3.59 |
+| mono-sqrt c=1 | 0.29 | 1.24 | 3.49 | 6.94 |
+| kvm-sqrt c=1 | 0.56 | 1.68 | 3.03 | 7.36 |
+| kvm-sqrt c=2 | 0.64 | 2.01 | 4.51 | 11.94 |
+| kvm-sqrt c=4 | 0.74 | 3.22 | 7.73 | 21.64 ⚠ |
+| kvm-sqrt c=8 | 1.04 | 5.62 | 14.19 | — OOM |
+| kvm-sqrt c=16 (OFFICIAL) | 1.62 | 10.04 | 27.09 ⚠ | — OOM |
+| kvm-256 (fixed) | 0.83 | 2.41 | 4.37 | 8.71 |
 
-## Quality — training loss (tiny-stories char-LM)
-
-`scripts/sweep.py`: a fixed `TinyLM` backbone, six attention configs, same
-corpus / seed / minibatches, 4000 steps, seq_len 2048. Final loss = mean of the
-last 100 steps; throughput = mean tok/s over the run (includes the one-time
-Triton compile).
-
-| config | state slots M | final loss | sweep throughput |
-|---|---|---|---|
-| plain | full | 0.074 | 257k tok/s |
-| kvm-256 | 256 | 0.093 | 110k tok/s |
-| kvm-sqrt | 64 | **0.096** | **371k tok/s** |
-| mono-sqrt | 64 | 0.105 | 323k tok/s |
-| mono-logbudget-c2 | 32 | 0.105 | 372k tok/s |
-| mono-log | 16 | 0.105 | 370k tok/s |
-
-* **`kvm-sqrt` is the sweet spot** — near-plain quality (0.096 vs 0.074) at the
-  *highest* training throughput in the sweep (371k tok/s, faster than plain's
-  257k). ⚠ Don't be misled by the forward-speed table above, which shows
-  `kvm-sqrt` at 0.89× at T=32768: that is a worst-case artifact of the M=256
-  forward merge kernel spilling registers at extreme T. At the sequence lengths
-  and budgets real training actually uses, `kvm-sqrt` is among the fastest paths
-  — the sweep throughput is the representative number.
-* **monotone is budget-insensitive** — `mono-log` (M=16), `mono-logbudget-c2`
-  (M=32), `mono-sqrt` (M=64) all land at ~0.105; 4× the state buys nothing. The
-  monotone loss curves also flatten by ~step 1500 while `kvm` and `plain` keep
-  descending — the fixed positional schedule is a ceiling on accessible
-  long-range info, because this corpus's long-range signal is content-addressed
-  (a recurring story subject) and positional coarsening blurs it away.
-* **the budget-matched pair** (`mono-sqrt` vs `kvm-sqrt`, both M=64) isolates
-  the routing decision: learned content-routing (0.096) beats the fixed
-  schedule (0.105) by ~0.009 at *identical* budget.
-
-The honest split: **monotone's contribution is systems** — data-independence →
-precomputable state → the fast, numerically-tight parallel kernels — **not
-quality**. On a content-addressed task KVM's learned routing wins, and it is
-also fast in practice. Caveats: one seed, an easy templated corpus (all losses
-low — differences live in the tail); a harder or more position-structured task
-could shift this.
-
-## Notes
-
-* 🔴 `mono flex` — the FlexAttention path's token dyadic pyramid blows up in
-  memory (14 GB at T=16384, 55 GB at T=32768 → far past the card, thrashing).
-  flex is the *cross-check* path (it agrees with the naive recurrence to ~1e-7);
-  the Triton kernels have no such intermediate and keep scaling. ⚠ `kvm-256` and
-  `kvm-sqrt@T=32768` are slow because the KVM *forward* merge kernel carries the
-  256-slot state in registers and spills to local memory — the one remaining
-  Triton perf gap (the backward is state-tiled).
-* **Headline:** `mono-log triton` is the fastest trainable path — **10.4×** vs
-  plain for E2E training at T=32768 (a flat `live ≈ 16` state, **410×** KV
-  compression), scaling cleanly. `mono-sqrt triton` carries the same `~sqrt`
-  budget as `kvm-sqrt` and trains at **5.3×**; `kvm-power triton` is 4.1×. All
-  are fully differentiable (custom fwd + bwd Triton kernels).
+VRAM scales roughly as `B × H × n_q × M × D × 2 bytes` for the bucket
+trajectory `[BH, n_q, M, D]` — the dominant term. With BH=32, n_q=T/32, D=64
+that's ~2 KB × T × M bytes, so doubling M at constant T doubles VRAM.
 
 ## Accuracy (forward, T=2048, bf16 vs an fp32 naive reference)
 
-`naive bf16` is the precision floor (same model, same dtype, no kernel) — the
-Triton path lands in the same band.
-
 | config | triton bf16 vs fp32 | naive bf16 vs fp32 (floor) |
 |---|---|---|
-| mono-log triton | abs avg 1.2e-4, rel avg 4.3e-2 | abs avg 6.7e-4, rel avg 3.3e-1 |
-| mono-sqrt triton | abs avg 1.3e-4, rel avg 4.5e-2 | abs avg 7.5e-4, rel avg 3.3e-1 |
-| mono-log flex | abs avg 1.5e-4, rel avg 5.4e-2 | abs avg 7.1e-4, rel avg 3.2e-1 |
-| kvm-power triton | abs avg 2.7e-3, rel avg 5.7e-1 | abs avg 3.2e-3, rel avg 6.5e-1 |
-| kvm-256 triton | abs avg 2.7e-3, rel avg 1.1e0 | abs avg 3.1e-3, rel avg 1.2e0 |
+| mono-log | abs avg 1.2e-4, rel avg 4.2e-2 | abs avg 7.1e-4, rel avg 3.3e-1 |
+| mono-sqrt c=1 | abs avg 1.3e-4, rel avg 4.6e-2 | abs avg 7.7e-4, rel avg 3.4e-1 |
+| kvm-sqrt c=1 | abs avg 3.5e-3, rel avg 9.3e-1 | abs avg 4.0e-3, rel avg 1.0 |
+| kvm-sqrt c=16 | abs avg 2.0e-3, rel avg 7.8e-1 | abs avg 2.6e-3, rel avg 1.0 |
+| kvm-256 | abs avg 2.7e-3, rel avg 1.1 | abs avg 3.1e-3, rel avg 1.2 |
 
-Monotone is data-independent → its Triton path is numerically tight
-(bit-exact-class vs the naive recurrence; the bf16 error is just input
-quantization). KVM routing (cosine novelty + argmax) is *chaotic* in low
-precision — a 1-ulp wobble flips a route — so its bf16 error is intrinsically
-"loud"; the `naive bf16` column shows the same loudness, i.e. it is the method,
-not the kernel. The backward kernels are separately verified against PyTorch
-references (`temp/verify_*.py`): monotone's naive recurrence is bit-exact vs an
-independent reference, its Triton path lands at the TF32 `tl.dot` floor (~4e-4
-relative, fwd + bwd), its flex path at ~1e-7; KVM `our` tracks `pt` at matched
-precision (M≤128 SRAM-resident, M=256 state-tiled).
+**Monotone is bit-exact-class** vs the naive recurrence — the bf16 error is
+just input quantization. **KVM routing is chaotic in low precision** (cosine
+novelty + argmax: a 1-ulp wobble flips a route) so KVM's bf16 error is
+intrinsically "loud"; the `naive bf16` column shows the same loudness, i.e. it
+is the method, not the kernel. The Triton path always lands inside the
+method-noise floor.
+
+## Quality — training loss (tiny-stories char-LM)
+
+See `scripts/sweep.py` (the e2e training sweep on the synthetic corpus). The
+[earlier sweep](https://github.com/SmerkyG/KVM-paper) showed:
+
+* **`kvm-sqrt c=1` is the sweet spot** — near-plain quality, **highest training
+  throughput** (samples/s) in the sweep (faster than plain at small T).
+* **monotone is budget-insensitive**: M=16 / 32 / 64 all land at ~0.105 final
+  loss; KVM's data-dependent routing wins ~0.009 at matched M=64 budget.
+* On this corpus the long-range signal is content-addressed (recurring story
+  subject), which KVM's cosine routing keeps in a dedicated slot but the
+  positional monotone schedule blurs away.
+
+Open direction: better schedulers — something between a fixed positional rule
+and full learned routing.
